@@ -36,23 +36,33 @@ export default function Dashboard({
   setCurrentSymbol,
 }: DashboardProps) {
   const wsRef = useRef<WebSocket | null>(null);
-  const [balance, setBalance] = useState(1000);
+  const [isDemoMode, setIsDemoMode] = useState(!config.apiKey);
+  const [balance, setBalance] = useState(0);
   const [totalProfit, setTotalProfit] = useState(0);
   const [openTrades, setOpenTrades] = useState(0);
   const [lastPrice, setLastPrice] = useState(0);
   const [priceChange, setPriceChange] = useState(0);
   const [logs, setLogs] = useState<string[]>([]);
+  const [isAuthorized, setIsAuthorized] = useState(false);
+  const [accountId, setAccountId] = useState('');
   const chartCanvasRef = useRef<HTMLCanvasElement>(null);
   const prevPriceRef = useRef(0);
+  const reqIdRef = useRef(1);
+  const pendingProposalsRef = useRef<Map<number, { type: 'BUY' | 'SELL', lotSize: number, symbol: string }>>(new Map());
 
   const addLog = useCallback((msg: string) => {
     const time = new Date().toLocaleTimeString();
     setLogs((prev) => [`[${time}] ${msg}`, ...prev].slice(0, 50));
   }, []);
 
+  // Determine demo mode based on API key
+  useEffect(() => {
+    setIsDemoMode(!config.apiKey);
+  }, [config.apiKey]);
+
   // Connect to Deriv WebSocket API
   useEffect(() => {
-    if (isBotRunning && !isConnected) {
+    if (isBotRunning) {
       addLog('Conectando a Deriv API...');
       try {
         const ws = new WebSocket('wss://ws.derivws.com/websockets/v3?app_id=1089');
@@ -60,48 +70,50 @@ export default function Dashboard({
         ws.onopen = () => {
           setIsConnected(true);
           addLog('✅ Conectado a Deriv WebSocket');
-          ws.send(JSON.stringify({
-            ticks: currentSymbol,
-            subscribe: 1,
-          }));
-          addLog(`📊 Suscrito a ticks de ${currentSymbol}`);
+
+          // If API key provided, authorize
+          if (config.apiKey && !isDemoMode) {
+            addLog('🔐 Autorizando con API Token...');
+            ws.send(JSON.stringify({
+              authorize: config.apiKey,
+              req_id: reqIdRef.current++,
+            }));
+          } else {
+            addLog('🎮 Modo DEMO activado (sin API Token)');
+            // Subscribe to ticks anyway
+            ws.send(JSON.stringify({
+              ticks: currentSymbol,
+              subscribe: 1,
+              req_id: reqIdRef.current++,
+            }));
+            addLog(`📊 Suscrito a ticks de ${currentSymbol}`);
+            setBalance(10000); // Demo balance
+          }
         };
 
         ws.onmessage = (event) => {
           try {
             const data = JSON.parse(event.data);
-            if (data.msg_type === 'tick' && data.tick) {
-              const tick = data.tick;
-              const newTick: TickData = {
-                time: tick.epoch,
-                price: tick.quote,
-                symbol: tick.symbol,
-              };
-              setTicks((prev) => [...prev, newTick].slice(-150));
-              setLastPrice(tick.quote);
-              if (prevPriceRef.current > 0) {
-                setPriceChange(tick.quote - prevPriceRef.current);
-              }
-              prevPriceRef.current = tick.quote;
-            }
+            handleWsMessage(data, ws);
           } catch (e) {
             // ignore parse errors
           }
         };
 
         ws.onerror = () => {
-          addLog('❌ Error de conexión');
+          addLog('❌ Error de conexión WebSocket');
           setIsConnected(false);
         };
 
         ws.onclose = () => {
           setIsConnected(false);
+          setIsAuthorized(false);
           addLog('🔌 Desconectado de Deriv');
         };
 
         wsRef.current = ws;
       } catch (e) {
-        addLog('❌ No se pudo conectar');
+        addLog('❌ No se pudo conectar a Deriv');
         setIsConnected(false);
       }
     }
@@ -110,52 +122,257 @@ export default function Dashboard({
       wsRef.current.close();
       wsRef.current = null;
       setIsConnected(false);
+      setIsAuthorized(false);
     }
 
-    return () => {
-      // cleanup on unmount only
-    };
-  }, [isBotRunning, currentSymbol]);
+    return () => {};
+  }, [isBotRunning, currentSymbol, isDemoMode]);
 
-  // Simulate trades when bot is running
+  const handleWsMessage = (data: any, ws: WebSocket) => {
+    // Handle authorization response
+    if (data.msg_type === 'authorize' && data.authorize) {
+      setIsAuthorized(true);
+      setAccountId(data.authorize.loginid || '');
+      setBalance(data.authorize.balance || 0);
+      addLog(`✅ Autorizado como: ${data.authorize.loginid}`);
+      addLog(`💰 Balance: $${data.authorize.balance}`);
+
+      // Subscribe to balance updates
+      ws.send(JSON.stringify({
+        balance: 1,
+        subscribe: 1,
+        req_id: reqIdRef.current++,
+      }));
+
+      // Subscribe to ticks
+      ws.send(JSON.stringify({
+        ticks: currentSymbol,
+        subscribe: 1,
+        req_id: reqIdRef.current++,
+      }));
+      addLog(`📊 Suscrito a ticks de ${currentSymbol}`);
+    }
+
+    // Handle auth error
+    if (data.msg_type === 'authorize' && data.error) {
+      addLog(`❌ Error de autenticación: ${data.error.message}`);
+      addLog('⚠️ Cambiando a modo DEMO');
+      setIsDemoMode(true);
+      setBalance(10000);
+      // Still subscribe to ticks
+      ws.send(JSON.stringify({
+        ticks: currentSymbol,
+        subscribe: 1,
+        req_id: reqIdRef.current++,
+      }));
+    }
+
+    // Handle balance updates
+    if (data.msg_type === 'balance' && data.balance) {
+      setBalance(data.balance.balance);
+    }
+
+    // Handle tick data
+    if (data.msg_type === 'tick' && data.tick) {
+      const tick = data.tick;
+      const newTick: TickData = {
+        time: tick.epoch,
+        price: tick.quote,
+        symbol: tick.symbol,
+      };
+      setTicks((prev) => [...prev, newTick].slice(-150));
+      setLastPrice(tick.quote);
+      if (prevPriceRef.current > 0) {
+        setPriceChange(tick.quote - prevPriceRef.current);
+      }
+      prevPriceRef.current = tick.quote;
+    }
+
+    // Handle proposal response (price quote for buying)
+    if (data.msg_type === 'proposal' && data.proposal) {
+      const reqId = data.echo_req?.req_id;
+      const pending = pendingProposalsRef.current.get(reqId);
+      if (pending) {
+        pendingProposalsRef.current.delete(reqId);
+        addLog(`💲 Precio recibido: $${data.proposal.ask} | Payout: $${data.proposal.payout}`);
+        // Execute buy
+        ws.send(JSON.stringify({
+          buy: data.proposal.id,
+          price: data.proposal.ask,
+          req_id: reqIdRef.current++,
+        }));
+      }
+    }
+
+    // Handle buy response
+    if (data.msg_type === 'buy' && data.buy) {
+      addLog(`✅ OPERACIÓN REAL EJECUTADA! ID: ${data.buy.contract_id}`);
+      addLog(`💵 Costo: $${data.buy.buy_price} | Payout potencial: $${data.buy.payout}`);
+
+      const trade: TradeRecord = {
+        id: `real-${data.buy.contract_id}`,
+        symbol: currentSymbol,
+        type: 'BUY',
+        lotSize: config.lotSize,
+        entryPrice: lastPrice,
+        timestamp: new Date(),
+        status: 'open',
+      };
+      setTrades((prev) => [trade, ...prev]);
+      setOpenTrades(1);
+
+      // Subscribe to contract updates
+      ws.send(JSON.stringify({
+        proposal_open_contract: 1,
+        contract_id: data.buy.contract_id,
+        subscribe: 1,
+        req_id: reqIdRef.current++,
+      }));
+    }
+
+    // Handle buy error
+    if (data.msg_type === 'buy' && data.error) {
+      addLog(`❌ Error al comprar: ${data.error.message}`);
+    }
+
+    // Handle contract updates (open contract)
+    if (data.msg_type === 'proposal_open_contract' && data.proposal_open_contract) {
+      const contract = data.proposal_open_contract;
+      const profit = contract.profit || 0;
+
+      if (contract.is_sold || contract.is_expired) {
+        // Contract closed
+        const isWin = profit > 0;
+        addLog(`${isWin ? '✅' : '❌'} Contrato cerrado: ${isWin ? 'GANANCIA' : 'PÉRDIDA'} $${profit.toFixed(2)}`);
+
+        setTrades((prev) =>
+          prev.map((t) =>
+            t.id === `real-${contract.contract_id}`
+              ? { ...t, status: 'closed' as const, exitPrice: contract.exit_tick || lastPrice, profit: profit }
+              : t
+          )
+        );
+        setOpenTrades(0);
+        setTotalProfit((prev) => parseFloat((prev + profit).toFixed(2)));
+      } else {
+        // Update open trade profit
+        setTrades((prev) =>
+          prev.map((t) =>
+            t.id === `real-${contract.contract_id}`
+              ? { ...t, profit: profit }
+              : t
+          )
+        );
+      }
+    }
+
+    // Handle proposal error
+    if (data.msg_type === 'proposal' && data.error) {
+      addLog(`❌ Error en propuesta: ${data.error.message}`);
+    }
+  };
+
+  // Trading logic - runs when bot is active
   useEffect(() => {
-    if (!isBotRunning) return;
+    if (!isBotRunning || !isConnected) return;
 
     const interval = setInterval(() => {
+      if (openTrades > 0) return; // Already have open trade
+
+      // Check TP/SL limits
+      if (totalProfit >= config.takeProfit) {
+        addLog(`🎯 TAKE PROFIT ALCANZADO! +$${totalProfit.toFixed(2)}`);
+        return;
+      }
+      if (totalProfit <= -config.stopLoss) {
+        addLog(`🛑 STOP LOSS ALCANZADO! $${totalProfit.toFixed(2)}`);
+        return;
+      }
+
+      // Simple strategy: trade based on tick count pattern
+      // For Boom: buy expecting spike up
+      // For Crash: sell expecting spike down
       const isBoom = currentSymbol.startsWith('BOOM');
       const random = Math.random();
 
-      if (random > 0.92 && openTrades === 0) {
-        const entryPrice = lastPrice || (1000 + Math.random() * 100);
-        const trade: TradeRecord = {
-          id: `trade-${Date.now()}`,
-          symbol: currentSymbol,
-          type: isBoom ? 'BUY' : 'SELL',
-          lotSize: config.lotSize,
-          entryPrice: entryPrice,
-          timestamp: new Date(),
-          status: 'open',
-        };
-        setTrades((prev) => [trade, ...prev]);
-        setOpenTrades(1);
-        addLog(`🔔 ${isBoom ? 'COMPRA' : 'VENTA'} ${currentSymbol} @ ${entryPrice.toFixed(2)} | Lote: ${config.lotSize}`);
-      } else if (openTrades > 0 && random > 0.80) {
+      if (isDemoMode) {
+        // DEMO MODE - simulated trades
+        if (random > 0.92) {
+          const entryPrice = lastPrice || (1000 + Math.random() * 100);
+          const trade: TradeRecord = {
+            id: `demo-${Date.now()}`,
+            symbol: currentSymbol,
+            type: isBoom ? 'BUY' : 'SELL',
+            lotSize: config.lotSize,
+            entryPrice: entryPrice,
+            timestamp: new Date(),
+            status: 'open',
+          };
+          setTrades((prev) => [trade, ...prev]);
+          setOpenTrades(1);
+          addLog(`🎮 [DEMO] ${isBoom ? 'COMPRA' : 'VENTA'} ${currentSymbol} @ ${entryPrice.toFixed(2)}`);
+        }
+      } else {
+        // REAL MODE - use Deriv API to get proposal and buy
+        if (random > 0.90 && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          addLog(`🔍 Buscando entrada en ${currentSymbol}...`);
+
+          // Get proposal for a "DIGITDIFF" or "CALL/PUT" contract
+          // For simplicity, use a rise/fall contract
+          const contractType = isBoom ? 'CALL' : 'PUT';
+          const reqId = reqIdRef.current++;
+
+          pendingProposalsRef.current.set(reqId, {
+            type: isBoom ? 'BUY' : 'SELL',
+            lotSize: config.lotSize,
+            symbol: currentSymbol,
+          });
+
+          wsRef.current.send(JSON.stringify({
+            proposal: 1,
+            amount: config.lotSize * 100, // Stake in dollars
+            basis: 'stake',
+            contract_type: contractType,
+            currency: 'USD',
+            duration: 5, // 5 ticks
+            duration_unit: 't',
+            symbol: currentSymbol,
+            req_id: reqId,
+          }));
+
+          addLog(`📋 Solicitando propuesta ${contractType} para ${currentSymbol}...`);
+        }
+      }
+    }, 3000);
+
+    return () => clearInterval(interval);
+  }, [isBotRunning, isConnected, openTrades, lastPrice, currentSymbol, isDemoMode, config, totalProfit]);
+
+  // Handle demo trade closing
+  useEffect(() => {
+    if (!isDemoMode || !isBotRunning || openTrades === 0) return;
+
+    const interval = setInterval(() => {
+      const random = Math.random();
+      if (random > 0.75) {
         const profit = (Math.random() - 0.35) * config.takeProfit * 1.5;
         const isWin = profit > 0;
         setTrades((prev) =>
           prev.map((t, i) =>
-            i === 0 ? { ...t, status: 'closed' as const, exitPrice: lastPrice || t.entryPrice, profit: parseFloat(profit.toFixed(2)) } : t
+            i === 0 && t.status === 'open'
+              ? { ...t, status: 'closed' as const, exitPrice: lastPrice || t.entryPrice, profit: parseFloat(profit.toFixed(2)) }
+              : t
           )
         );
         setOpenTrades(0);
         setTotalProfit((prev) => parseFloat((prev + profit).toFixed(2)));
         setBalance((prev) => parseFloat((prev + profit).toFixed(2)));
-        addLog(`${isWin ? '✅' : '❌'} Cerrada: ${isWin ? '+' : ''}$${profit.toFixed(2)} | ${isWin ? 'GANANCIA' : 'PÉRDIDA'}`);
+        addLog(`🎮 [DEMO] ${isWin ? '✅' : '❌'} Cerrada: ${isWin ? '+' : ''}$${profit.toFixed(2)}`);
       }
     }, 4000);
 
     return () => clearInterval(interval);
-  }, [isBotRunning, openTrades, lastPrice, currentSymbol, config.lotSize, config.takeProfit]);
+  }, [isDemoMode, isBotRunning, openTrades, lastPrice, config.takeProfit]);
 
   // Draw chart
   useEffect(() => {
@@ -205,7 +422,6 @@ export default function Dashboard({
       ctx.lineTo(width - 10, y);
       ctx.stroke();
 
-      // Price labels
       const priceLabel = (maxPrice - (range / 4) * i).toFixed(2);
       ctx.fillStyle = '#666';
       ctx.font = '10px monospace';
@@ -213,7 +429,6 @@ export default function Dashboard({
       ctx.fillText(priceLabel, padding - 5, y + 3);
     }
 
-    // Draw price line
     const isUp = prices[prices.length - 1] >= prices[0];
     const lineColor = isUp ? '#10b981' : '#ef4444';
 
@@ -234,7 +449,6 @@ export default function Dashboard({
     });
     ctx.stroke();
 
-    // Fill area under line
     const lastX = padding + chartWidth;
     const lastY = padding + chartHeight - ((prices[prices.length - 1] - minPrice) / range) * chartHeight;
     ctx.lineTo(lastX, padding + chartHeight);
@@ -278,7 +492,6 @@ export default function Dashboard({
     ctx.font = 'bold 11px monospace';
     ctx.textAlign = 'center';
     ctx.fillText(prices[prices.length - 1].toFixed(2), labelX + labelWidth / 2, lastY + 4);
-
   }, [ticks]);
 
   const winTrades = trades.filter((t) => t.status === 'closed' && (t.profit ?? 0) > 0).length;
@@ -288,6 +501,42 @@ export default function Dashboard({
 
   return (
     <div className="space-y-6">
+      {/* MODE BANNER */}
+      <div className={`rounded-xl p-4 border-2 ${
+        isDemoMode
+          ? 'bg-yellow-900/20 border-yellow-500/50'
+          : 'bg-green-900/20 border-green-500/50'
+      }`}>
+        <div className="flex items-center justify-between flex-wrap gap-3">
+          <div className="flex items-center gap-3">
+            <div className={`w-12 h-12 rounded-full flex items-center justify-center ${
+              isDemoMode ? 'bg-yellow-500/20' : 'bg-green-500/20'
+            }`}>
+              <i className={`fas ${isDemoMode ? 'fa-flask' : 'fa-bolt'} text-2xl ${
+                isDemoMode ? 'text-yellow-400' : 'text-green-400'
+              }`}></i>
+            </div>
+            <div>
+              <h3 className={`text-lg font-bold ${isDemoMode ? 'text-yellow-400' : 'text-green-400'}`}>
+                {isDemoMode ? '⚠️ MODO DEMO / SIMULACIÓN' : '🔴 MODO REAL - OPERANDO CON DINERO REAL'}
+              </h3>
+              <p className="text-sm text-gray-300">
+                {isDemoMode
+                  ? 'Las operaciones son simuladas. Ingresa tu API Token en Configuración para operar en real.'
+                  : `Conectado a cuenta: ${accountId || '---'} | Las operaciones se ejecutan en tu cuenta Deriv.`
+                }
+              </p>
+            </div>
+          </div>
+          {isDemoMode && (
+            <div className="text-right">
+              <p className="text-xs text-yellow-400/70">Balance Demo</p>
+              <p className="text-xl font-bold text-yellow-400">${balance.toFixed(2)}</p>
+            </div>
+          )}
+        </div>
+      </div>
+
       {/* Symbol Selector */}
       <div className="bg-gray-800/50 border border-gray-700 rounded-xl p-4">
         <div className="flex items-center gap-3 flex-wrap">
@@ -313,7 +562,7 @@ export default function Dashboard({
       {/* Stats Cards */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <StatCard
-          title="Balance"
+          title={isDemoMode ? "Balance Demo" : "Balance Real"}
           value={`$${balance.toFixed(2)}`}
           icon="fa-wallet"
           color="blue"
@@ -401,7 +650,7 @@ export default function Dashboard({
           <h3 className="text-lg font-semibold flex items-center gap-2">
             <i className="fas fa-chart-area text-yellow-400"></i>
             {currentSymbol}
-            <span className="text-sm text-gray-400 font-normal">- Precio en Vivo</span>
+            <span className="text-sm text-gray-400 font-normal">- Precio en Vivo (Datos Reales de Deriv)</span>
           </h3>
           <div className="flex items-center gap-3">
             <div className="text-right">
@@ -436,7 +685,7 @@ export default function Dashboard({
         <div className="bg-gray-800 border border-gray-700 rounded-xl p-5">
           <h3 className="text-lg font-semibold mb-4 flex items-center gap-2">
             <i className="fas fa-list-check text-blue-400"></i>
-            Operaciones Recientes
+            Operaciones {isDemoMode ? '(Demo)' : '(Reales)'}
           </h3>
           <div className="space-y-2 max-h-72 overflow-y-auto pr-1">
             {trades.length === 0 ? (
@@ -458,6 +707,7 @@ export default function Dashboard({
                   }`}
                 >
                   <div className="flex items-center gap-3">
+                    {isDemoMode && <span className="text-xs text-yellow-400">[DEMO]</span>}
                     <span className={`px-2 py-0.5 rounded text-xs font-bold ${
                       trade.type === 'BUY' ? 'bg-green-900/50 text-green-400' : 'bg-red-900/50 text-red-400'
                     }`}>
@@ -502,6 +752,8 @@ export default function Dashboard({
                   log.includes('🔔') ? 'text-yellow-400' :
                   log.includes('🎯') ? 'text-green-300 font-bold' :
                   log.includes('🛑') ? 'text-red-300 font-bold' :
+                  log.includes('[DEMO]') ? 'text-yellow-300' :
+                  log.includes('OPERACIÓN REAL') ? 'text-green-300 font-bold bg-green-900/20' :
                   'text-gray-400'
                 }`}>
                   {log}

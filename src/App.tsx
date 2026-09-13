@@ -21,11 +21,13 @@ function App() {
     apiKey: '',
   });
 
+  const isDemoMode = !config.apiKey;
+
   return (
     <div className="min-h-screen bg-gray-900 text-white">
       {/* Header */}
       <header className="bg-gray-800 border-b border-gray-700 px-6 py-4">
-        <div className="max-w-7xl mx-auto flex items-center justify-between">
+        <div className="max-w-7xl mx-auto flex items-center justify-between flex-wrap gap-3">
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 bg-gradient-to-br from-yellow-400 to-orange-500 rounded-lg flex items-center justify-center">
               <i className="fas fa-robot text-white text-lg"></i>
@@ -35,7 +37,16 @@ function App() {
               <p className="text-xs text-gray-400">MT5 Trading Panel</p>
             </div>
           </div>
-          <div className="flex items-center gap-4">
+          <div className="flex items-center gap-3 flex-wrap">
+            {/* Mode Indicator */}
+            <div className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-sm font-medium border ${
+              isDemoMode
+                ? 'bg-yellow-900/30 text-yellow-400 border-yellow-600/50'
+                : 'bg-green-900/30 text-green-400 border-green-600/50'
+            }`}>
+              <i className={`fas ${isDemoMode ? 'fa-flask' : 'fa-bolt'}`}></i>
+              {isDemoMode ? 'MODO DEMO' : 'MODO REAL'}
+            </div>
             <div className={`flex items-center gap-2 px-3 py-1.5 rounded-full text-sm ${isConnected ? 'bg-green-900/50 text-green-400' : 'bg-red-900/50 text-red-400'}`}>
               <div className={`w-2 h-2 rounded-full ${isConnected ? 'bg-green-400 animate-pulse' : 'bg-red-400'}`}></div>
               {isConnected ? 'Conectado' : 'Desconectado'}
@@ -102,6 +113,14 @@ function App() {
           <MQL5Generator config={config} />
         )}
       </main>
+
+      {/* Footer */}
+      <footer className="bg-gray-800/50 border-t border-gray-700 px-6 py-4 mt-8">
+        <div className="max-w-7xl mx-auto text-center text-xs text-gray-500">
+          <p>⚠️ El trading conlleva riesgos. Opera bajo tu propia responsabilidad. Prueba siempre en cuenta demo primero.</p>
+          <p className="mt-1">Deriv Boom & Crash Bot Panel v1.0 | Conectado vía WebSocket API de Deriv</p>
+        </div>
+      </footer>
     </div>
   );
 }
